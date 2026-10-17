@@ -1,12 +1,10 @@
 /**
  * utils/viewOnceHandler.js
- * Logique partagée entre /vv (manuel) et /autovv (automatique) :
- * télécharge un média vue-unique et l'envoie vers "Vous" + Telegram.
+ * Logique partagée /vv (manuel) et /autovv (auto).
  */
-const { downloadContentFromMessage, jidNormalizedUser } = require('@whiskeysockets/baileys');
+const { downloadContentFromMessage, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const tg = require('./telegram');
 
-/** Vérifie si un message contient un média vue-unique. */
 function isViewOnce(msg) {
   const m = msg?.message;
   if (!m) return false;
@@ -14,92 +12,107 @@ function isViewOnce(msg) {
     m.viewOnceMessageV2 ||
     m.viewOnceMessageV2Extension ||
     m.viewOnceMessage ||
-    m.viewOnce ||
     m?.imageMessage?.viewOnce ||
     m?.videoMessage?.viewOnce ||
     m?.audioMessage?.viewOnce
   );
 }
 
-/** Extrait le message réel depuis les wrappers vue-unique. */
-function unwrap(quotedOrMsg) {
-  let m = quotedOrMsg;
-  if (m.viewOnceMessageV2Extension) m = m.viewOnceMessageV2Extension.message;
-  else if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
-  else if (m.viewOnceMessage) m = m.viewOnceMessage.message;
+function unwrap(m) {
+  if (!m) return m;
+  if (m.viewOnceMessageV2Extension) return m.viewOnceMessageV2Extension.message || m;
+  if (m.viewOnceMessageV2) return m.viewOnceMessageV2.message || m;
+  if (m.viewOnceMessage) return m.viewOnceMessage.message || m;
   return m;
 }
 
-/**
- * Télécharge et renvoie un média vue-unique.
- * @param {object} sock        - Socket Baileys
- * @param {object} rawMsg      - Message brut (pour /autovv) ou msg de la commande (pour /vv)
- * @param {object} quotedMsgObj - quotedMessage extrait (pour /vv) ou null (pour /autovv)
- * @param {string} senderJid   - JID de l'expéditeur
- * @param {string} sourceChat  - JID du chat source
- * @param {string} groupName   - Nom du groupe (ou null si privé)
- * @param {string} originalCaption - Légende originale
- */
-async function processAndForward(sock, rawMsg, quotedMsgObj, senderJid, sourceChat, groupName, originalCaption) {
-  const selfJid = jidNormalizedUser(sock.user.id);
-  const senderNum = String(senderJid || '').split('@')[0].split(':')[0];
+function findMedia(msgObj) {
+  if (!msgObj) return { actualMsg: null, mtype: null };
+  const types = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
+  for (const t of types) {
+    if (msgObj[t]) return { actualMsg: msgObj, mtype: t };
+  }
+  return { actualMsg: null, mtype: null };
+}
 
-  // Ligne d'info expéditeur
-  const where = groupName ? `groupe *${groupName}*` : 'discussion privée';
-  const infoLine = `👁️ *Vue unique* de *+${senderNum}* (${where})`;
-  const caption = originalCaption
-    ? `${infoLine}\n\n📝 ${originalCaption}`
-    : infoLine;
-
-  // Résoudre le message réel à télécharger
-  let actualMsg = null;
-  let mtype = null;
-
-  if (quotedMsgObj) {
-    // Mode /vv : on a le quotedMessage
-    const unwrapped = unwrap(quotedMsgObj);
-    const types = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
-    for (const t of types) {
-      if (unwrapped[t]) { actualMsg = unwrapped; mtype = t; break; }
-    }
-  } else {
-    // Mode autovv : le message lui-même est vue-unique
-    const unwrapped = unwrap(rawMsg.message);
-    const types = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
-    for (const t of types) {
-      if (unwrapped[t]) { actualMsg = unwrapped; mtype = t; break; }
+async function downloadAuto(sock, rawMsg) {
+  // Méthode 1 : downloadMediaMessage avec reuploadRequest
+  try {
+    const buf = await downloadMediaMessage(
+      rawMsg, 'buffer', {},
+      { reuploadRequest: sock.updateMediaMessage }
+    );
+    if (buf && buf.length > 0) return buf;
+  } catch (e1) {
+    console.error('[VH] downloadMediaMessage failed:', e1.message);
+  }
+  // Méthode 2 : downloadContentFromMessage sur le contenu déballé
+  const unwrapped = unwrap(rawMsg.message);
+  const { actualMsg, mtype } = findMedia(unwrapped);
+  if (actualMsg && mtype) {
+    const mediaInfo = actualMsg[mtype];
+    if (mediaInfo?.mediaKey?.length) {
+      const stream = await downloadContentFromMessage(mediaInfo, mtype.replace('Message', ''));
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      return Buffer.concat(chunks);
     }
   }
+  throw new Error('Média non disponible. WhatsApp a peut-être déjà expiré ce contenu.');
+}
 
-  if (!actualMsg || !mtype) {
-    await sock.sendMessage(selfJid, { text: `${infoLine}\n\n❓ Type de média non reconnu.` }, {});
-    return false;
-  }
-
+async function downloadManual(quotedMsgObj) {
+  const unwrapped = unwrap(quotedMsgObj);
+  const { actualMsg, mtype } = findMedia(unwrapped);
+  if (!actualMsg || !mtype) throw new Error('Type de média non reconnu.');
   const mediaInfo = actualMsg[mtype];
   const stream = await downloadContentFromMessage(mediaInfo, mtype.replace('Message', ''));
   const chunks = [];
   for await (const chunk of stream) chunks.push(chunk);
-  const buffer = Buffer.concat(chunks);
+  return { buffer: Buffer.concat(chunks), actualMsg, mtype };
+}
 
-  // Envoi WhatsApp → "Vous"
+async function sendMedia(sock, destJid, buffer, mtype, caption, mediaInfo) {
   if (mtype === 'imageMessage') {
-    await sock.sendMessage(selfJid, { image: buffer, caption }, {});
-    await tg.sendMedia(buffer, 'image', caption, 'image.jpg');
+    await sock.sendMessage(destJid, { image: buffer, caption }, {});
+    await tg.sendMedia(buffer, 'image', caption, 'image.jpg').catch(() => {});
   } else if (mtype === 'videoMessage') {
-    await sock.sendMessage(selfJid, { video: buffer, caption }, {});
-    await tg.sendMedia(buffer, 'video', caption, 'video.mp4');
+    await sock.sendMessage(destJid, { video: buffer, caption }, {});
+    await tg.sendMedia(buffer, 'video', caption, 'video.mp4').catch(() => {});
   } else if (mtype === 'audioMessage') {
     const ptt = mediaInfo?.ptt ?? true;
-    await sock.sendMessage(selfJid, { audio: buffer, ptt, mimetype: 'audio/ogg; codecs=opus' }, {});
-    await tg.sendText(caption);
-    await tg.sendMedia(buffer, 'audio', caption, 'audio.ogg');
+    await sock.sendMessage(destJid, { audio: buffer, ptt, mimetype: 'audio/ogg; codecs=opus' }, {});
+    await tg.sendText(caption).catch(() => {});
+    await tg.sendMedia(buffer, 'audio', caption, 'audio.ogg').catch(() => {});
   } else {
-    await sock.sendMessage(selfJid, { document: buffer, caption, mimetype: mediaInfo?.mimetype || 'application/octet-stream' }, {});
-    await tg.sendMedia(buffer, 'document', caption, 'file');
+    await sock.sendMessage(destJid, { document: buffer, caption, mimetype: mediaInfo?.mimetype || 'application/octet-stream' }, {});
+    await tg.sendMedia(buffer, 'document', caption, 'file').catch(() => {});
   }
+}
 
-  return true;
+async function processAndForward(sock, rawMsg, quotedMsgObj, senderJid, sourceChat, groupName, originalCaption) {
+  const selfJid = String(sock.user.id).split(':')[0] + '@s.whatsapp.net';
+  const senderNum = String(senderJid || '').split('@')[0].split(':')[0];
+  const where = groupName ? ('groupe *' + groupName + '*') : 'discussion privée';
+  const infoLine = '👁️ *Vue unique* de *+' + senderNum + '* (' + where + ')';
+  const caption = originalCaption ? (infoLine + '\n\n📝 ' + originalCaption) : infoLine;
+
+  try {
+    if (quotedMsgObj) {
+      const { buffer, actualMsg, mtype } = await downloadManual(quotedMsgObj);
+      await sendMedia(sock, selfJid, buffer, mtype, caption, actualMsg[mtype]);
+    } else {
+      const buffer = await downloadAuto(sock, rawMsg);
+      const unwrapped = unwrap(rawMsg.message);
+      const { mtype } = findMedia(unwrapped);
+      const guessedType = mtype || 'imageMessage';
+      await sendMedia(sock, selfJid, buffer, guessedType, caption, unwrapped?.[guessedType] || {});
+    }
+    return true;
+  } catch (err) {
+    await sock.sendMessage(selfJid, { text: '❌ ' + infoLine + '\n\nErreur : ' + err.message }, {});
+    return false;
+  }
 }
 
 module.exports = { isViewOnce, processAndForward, unwrap };
