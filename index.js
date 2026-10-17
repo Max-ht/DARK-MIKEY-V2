@@ -265,7 +265,52 @@ async function startBot() {
         })();
       }
 
-            handler.handleMessage(sock, msg).catch(err => {
+                  // ── Anti-delete : détection des suppressions "pour tout le monde" ──
+      if (antiDeleteStore.hasAny()) {
+        const proto = msg.message?.protocolMessage;
+        const isRevoke = proto?.type === 5 || String(proto?.type) === 'REVOKE';
+        if (isRevoke && antiDeleteStore.isEnabled(from)) {
+          const selfJid = String(sock.user.id).split(':')[0] + '@s.whatsapp.net';
+          const deletedId = proto.key?.id;
+          if (deletedId) {
+            (async () => {
+              try {
+                const chatMsgs = store.messages.get(from);
+                const cached = chatMsgs?.get(deletedId);
+                if (!cached?.message) return;
+                const senderJid = cached.key.participant || (cached.key.fromMe ? selfJid : from);
+                const senderNum = String(senderJid).split('@')[0].split(':')[0];
+                let groupPrefix = '';
+                if (from.endsWith('@g.us')) {
+                  try { const meta = await sock.groupMetadata(from); groupPrefix = '👥 *' + (meta?.subject || 'Groupe') + '*\n'; } catch {}
+                }
+                const infoLine = '🗑️ *Message supprimé*\n' + groupPrefix + '📱 De : +' + senderNum;
+                const content = cached.message;
+                const text = content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.videoMessage?.caption || '';
+                const mtype = ['imageMessage','videoMessage','audioMessage','stickerMessage','documentMessage'].find(t => content[t]);
+                if (mtype && mtype !== 'stickerMessage') {
+                  try {
+                    const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+                    const buf = await downloadMediaMessage(cached, 'buffer', {}, { reuploadRequest: sock.updateMediaMessage });
+                    if (mtype === 'imageMessage') await sock.sendMessage(selfJid, { image: buf, caption: infoLine + (text ? '\n\n📝 ' + text : '') }, {});
+                    else if (mtype === 'videoMessage') await sock.sendMessage(selfJid, { video: buf, caption: infoLine + (text ? '\n\n📝 ' + text : '') }, {});
+                    else if (mtype === 'audioMessage') { await sock.sendMessage(selfJid, { audio: buf, ptt: content.audioMessage?.ptt ?? true, mimetype: 'audio/ogg; codecs=opus' }, {}); await sock.sendMessage(selfJid, { text: infoLine }, {}); }
+                    else { await sock.sendMessage(selfJid, { document: buf, mimetype: content[mtype]?.mimetype || 'application/octet-stream' }, {}); await sock.sendMessage(selfJid, { text: infoLine }, {}); }
+                  } catch { await sock.sendMessage(selfJid, { text: infoLine + '\n\n📎 _Média non récupérable_' }, {}); }
+                } else if (mtype === 'stickerMessage') {
+                  try { const { downloadMediaMessage } = require('@whiskeysockets/baileys'); const buf = await downloadMediaMessage(cached, 'buffer', {}); await sock.sendMessage(selfJid, { sticker: buf }, {}); await sock.sendMessage(selfJid, { text: infoLine }, {}); }
+                  catch { await sock.sendMessage(selfJid, { text: infoLine + '\n\n🎭 _Sticker supprimé_' }, {}); }
+                } else {
+                  if (text) await sock.sendMessage(selfJid, { text: infoLine + '\n\n💬 "' + text + '"' }, {});
+                }
+              } catch (err) { console.error('[anti-delete]', err.message); }
+            })();
+          }
+          continue;
+        }
+      }
+
+      handler.handleMessage(sock, msg).catch(err => { 
         if (!err.message?.includes('rate-overlimit')) console.error('Error handling message:', err.message);
       });
 
@@ -283,88 +328,6 @@ async function startBot() {
     }
   });
 
-
-  // ── Anti-delete : récupération des messages supprimés ──
-  sock.ev.on('messages.delete', async (item) => {
-    if (!antiDeleteStore.hasAny()) return;
-    const selfJid = String(sock.user.id).split(':')[0] + '@s.whatsapp.net';
-    const keys = item.keys || [];
-    for (const key of keys) {
-      const chatId = key.remoteJid;
-      if (!chatId || !antiDeleteStore.isEnabled(chatId)) continue;
-      try {
-        // Récupérer le message depuis le store
-        const cached = await store.loadMessage(chatId, key.id);
-        if (!cached || !cached.message) continue;
-
-        const senderJid = cached.key.participant || (cached.key.fromMe ? selfJid : chatId);
-        const senderNum = String(senderJid).split('@')[0].split(':')[0];
-
-        let groupPrefix = '';
-        if (chatId.endsWith('@g.us')) {
-          try {
-            const meta = await handler.getGroupMetadata(sock, chatId);
-            groupPrefix = `👥 *${meta?.subject || 'Groupe'}*
-`;
-          } catch {}
-        }
-
-        const msgContent = cached.message;
-        const text = msgContent.conversation
-          || msgContent.extendedTextMessage?.text
-          || msgContent.imageMessage?.caption
-          || msgContent.videoMessage?.caption
-          || '';
-        const mtype = Object.keys(msgContent).find(k =>
-          ['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage'].includes(k)
-        );
-
-        const infoLine = `🗑️ *Message supprimé*
-${groupPrefix}📱 De : +${senderNum}`;
-
-        if (mtype && mtype !== 'stickerMessage') {
-          const { downloadMediaMessage } = require('@whiskeysockets/baileys');
-          try {
-            const buf = await downloadMediaMessage(cached, 'buffer', {});
-            const captionText = infoLine + (text ? '\n\n📝 ' + text : '');
-            if (mtype === 'imageMessage') {
-              await sock.sendMessage(selfJid, { image: buf, caption: captionText }, {});
-            } else if (mtype === 'videoMessage') {
-              await sock.sendMessage(selfJid, { video: buf, caption: captionText }, {});
-            } else if (mtype === 'audioMessage') {
-              await sock.sendMessage(selfJid, { audio: buf, ptt: msgContent.audioMessage?.ptt ?? true, mimetype: 'audio/ogg; codecs=opus' }, {});
-              await sock.sendMessage(selfJid, { text: infoLine }, {});
-            } else {
-              await sock.sendMessage(selfJid, { document: buf, mimetype: msgContent[mtype]?.mimetype || 'application/octet-stream' }, {});
-              await sock.sendMessage(selfJid, { text: infoLine }, {});
-            }
-          } catch (dlErr) {
-            await sock.sendMessage(selfJid, { text: `${infoLine}
-
-📎 _Média non récupérable_` }, {});
-          }
-        } else if (mtype === 'stickerMessage') {
-          try {
-            const { downloadMediaMessage } = require('@whiskeysockets/baileys');
-            const buf = await downloadMediaMessage(cached, 'buffer', {});
-            await sock.sendMessage(selfJid, { sticker: buf }, {});
-            await sock.sendMessage(selfJid, { text: infoLine }, {});
-          } catch {
-            await sock.sendMessage(selfJid, { text: `${infoLine}
-
-🎭 _Sticker supprimé_` }, {});
-          }
-        } else {
-          if (!text) continue; // Ne rien envoyer si vide
-          await sock.sendMessage(selfJid, { text: `${infoLine}
-
-💬 "${text}"` }, {});
-        }
-      } catch (err) {
-        console.error('[anti-delete]', err.message);
-      }
-    }
-  });
 
   sock.ev.on('error', (error) => {
     const statusCode = error?.output?.statusCode;
